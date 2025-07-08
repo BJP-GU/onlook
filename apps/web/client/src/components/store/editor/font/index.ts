@@ -25,7 +25,7 @@ import {
     removeFontsFromClassName,
     validateFontImportAndExport,
 } from '@onlook/fonts';
-import { BrandTabValue, type RawFont } from '@onlook/models';
+import { BrandTabValue, type FontConfig, type FontUploadFile, type RawFont } from '@onlook/models';
 import type { Font } from '@onlook/models/assets';
 import { generate, parse, traverse, type NodePath } from '@onlook/parser';
 import { getFontFileName } from '@onlook/utility';
@@ -58,6 +58,7 @@ export class FontManager {
     private _batchSize = 20;
     private _isFetching = false;
     private _isUploading = false;
+    private _isScanning = false;
     private _fontSearchIndex: FlexSearch.Document;
     private _allFontFamilies: RawFont[] = FAMILIES as RawFont[];
     private disposers: Array<() => void> = [];
@@ -105,12 +106,14 @@ export class FontManager {
         const sandboxDisposer = reaction(
             () => this.editorEngine.sandbox?.session.isConnecting,
             async (isConnecting) => {
+                console.log('isConnecting', isConnecting);
                 if (!isConnecting) {
+                    this.setupFontConfigFileWatcher();
                     await this.existingOrCreateTailwindConfigFile();
                     await this.updateFontConfigPath();
                     await this.loadInitialFonts();
-                    this.setupFontConfigFileWatcher();
                     await this.scanFonts();
+                    await this.syncFontsWithConfigs();
                 } else {
                     this.cleanupFontConfigFileWatcher();
                 }
@@ -179,15 +182,13 @@ export class FontManager {
             return [];
         }
 
+        this._isScanning = true;
         try {
             let existedFonts: Font[] | undefined = [];
-            try {
-                existedFonts = await this.scanExistingFonts();
-                if (existedFonts && existedFonts.length > 0) {
-                    await this.addFonts(existedFonts);
-                }
-            } catch (existingFontsError) {
-                console.error('Error scanning existing fonts:', existingFontsError);
+
+            existedFonts = await this.scanExistingFonts();
+            if (existedFonts && existedFonts.length > 0) {
+                await this.addFonts(existedFonts);
             }
 
             const fileExists = await sandbox.fileExists(this.fontConfigPath);
@@ -202,19 +203,16 @@ export class FontManager {
                 return [];
             }
 
-            try {
-                const fonts = extractFontImport(content);
-                this._fonts = fonts;
+            const fonts = extractFontImport(content);
+            this._fonts = fonts;
 
-                await this.getDefaultFont();
-                return fonts;
-            } catch (parseError) {
-                console.error('Error parsing font file:', parseError);
-                return [];
-            }
+            await this.getDefaultFont();
+            return fonts;
         } catch (error) {
             console.error('Error scanning fonts:', error);
             return [];
+        } finally {
+            this._isScanning = false;
         }
     }
 
@@ -300,8 +298,7 @@ export class FontManager {
             // Update the fonts array
             this._fonts.push(font);
 
-            // Scan the fonts and load the new font
-            await this.scanFonts();
+            // Load the new font
             await this.loadFontBatch([font]);
 
             return true;
@@ -395,90 +392,39 @@ export class FontManager {
         }
     }
 
-    async uploadFonts(
-        fontFiles: {
-            file: { name: string; buffer: number[] };
-            name: string;
-            weight: string;
-            style: string;
-        }[],
-    ) {
+    async uploadFonts(fontFiles: FontUploadFile[]) {
         this._isUploading = true;
         try {
             const routerConfig = await this.detectRouterType();
-
             if (!routerConfig?.basePath) {
                 console.error('Could not get base path');
                 return false;
             }
 
-            // Read the current font configuration file
             const { ast, content } = (await this.readFontConfigFile()) ?? {};
             if (!ast || !content) {
                 console.error('Failed to read font config file');
                 return false;
             }
 
-            // Check if the localFont import already exists
-            const hasLocalFontImport = this.isLocalFontImportExists(ast);
-            // Extract the base font name from the first file
             const baseFontName = fontFiles[0]?.name.split('.')[0] ?? 'customFont';
             const fontName = camelCase(`custom-${baseFontName}`);
 
-            // Check if this font name already exists
             const { fontNameExists, existingFontNode } = this.isFontNameExists(ast, fontName);
 
-            // Save font files and prepare font configuration
-            const fontConfigs = await Promise.all(
-                fontFiles.map(async (fontFile) => {
-                    const weight = fontFile.weight;
-                    const style = fontFile.style.toLowerCase();
-                    const fileName = getFontFileName(baseFontName, weight, style);
-                    const filePath = pathModule.join(
-                        DefaultSettings.FONT_FOLDER,
-                        `${fileName}.${fontFile.file.name.split('.').pop()}`,
-                    );
+            const fontConfigs = await this.processFontFiles(fontFiles, baseFontName);
+            const fontsSrc = this.createFontSrcObjects(fontConfigs);
 
-                    // Save the file as binary data
-                    const buffer = Buffer.from(fontFile.file.buffer);
-                    await this.editorEngine.sandbox.writeBinaryFile(filePath, buffer);
-
-                    return {
-                        path: `fonts/${fileName}.${fontFile.file.name.split('.').pop()}`,
-                        weight,
-                        style,
-                    };
-                }),
+            await this.updateAstWithFontConfig(
+                ast,
+                fontName,
+                fontsSrc,
+                fontNameExists,
+                existingFontNode,
             );
 
-            // Create array elements for the src property
-            const fontsSrc = fontConfigs.map((config) =>
-                t.objectExpression([
-                    t.objectProperty(t.identifier('path'), t.stringLiteral(config.path)),
-                    t.objectProperty(t.identifier('weight'), t.stringLiteral(config.weight)),
-                    t.objectProperty(t.identifier('style'), t.stringLiteral(config.style)),
-                ]),
-            );
-
-            if (fontNameExists && existingFontNode) {
-                // Merge new font configurations with existing ones
-                this.mergeFontConfig(ast, existingFontNode, fontName, fontsSrc);
-            } else {
-                createFontConfig(ast, fontName, fontsSrc);
-
-                if (!hasLocalFontImport) {
-                    const importDeclaration = t.importDeclaration(
-                        [t.importDefaultSpecifier(t.identifier('localFont'))],
-                        t.stringLiteral('next/font/local'),
-                    );
-                    ast.program.body.unshift(importDeclaration);
-                }
-            }
-
-            // Generate and write the updated code back to the file
             const { code } = generate(ast);
             await this.editorEngine.sandbox.writeFile(this.fontConfigPath, code);
-
             await this.scanFonts();
 
             return true;
@@ -487,6 +433,63 @@ export class FontManager {
             return false;
         } finally {
             this._isUploading = false;
+        }
+    }
+
+    private async processFontFiles(fontFiles: FontUploadFile[], baseFontName: string) {
+        return Promise.all(
+            fontFiles.map(async (fontFile) => {
+                const weight = fontFile.weight;
+                const style = fontFile.style.toLowerCase();
+                const fileName = getFontFileName(baseFontName, weight, style);
+                const filePath = pathModule.join(
+                    DefaultSettings.FONT_FOLDER,
+                    `${fileName}.${fontFile.file.name.split('.').pop()}`,
+                );
+
+                const buffer = Buffer.from(fontFile.file.buffer);
+                await this.editorEngine.sandbox.writeBinaryFile(filePath, buffer);
+
+                return {
+                    path: `fonts/${fileName}.${fontFile.file.name.split('.').pop()}`,
+                    weight,
+                    style,
+                };
+            }),
+        );
+    }
+
+    private createFontSrcObjects(fontConfigs: FontConfig[]) {
+        return fontConfigs.map((config) =>
+            t.objectExpression([
+                t.objectProperty(t.identifier('path'), t.stringLiteral(config.path)),
+                t.objectProperty(t.identifier('weight'), t.stringLiteral(config.weight)),
+                t.objectProperty(t.identifier('style'), t.stringLiteral(config.style)),
+            ]),
+        );
+    }
+
+    private async updateAstWithFontConfig(
+        ast: ParseResult<t.File>,
+        fontName: string,
+        fontsSrc: t.ObjectExpression[],
+        fontNameExists: boolean,
+        existingFontNode: t.ExportNamedDeclaration | null,
+    ) {
+        const hasLocalFontImport = this.isLocalFontImportExists(ast);
+
+        if (fontNameExists && existingFontNode) {
+            this.mergeFontConfig(ast, existingFontNode, fontName, fontsSrc);
+        } else {
+            createFontConfig(ast, fontName, fontsSrc);
+
+            if (!hasLocalFontImport) {
+                const importDeclaration = t.importDeclaration(
+                    [t.importDefaultSpecifier(t.identifier('localFont'))],
+                    t.stringLiteral('next/font/local'),
+                );
+                ast.program.body.unshift(importDeclaration);
+            }
         }
     }
 
@@ -545,8 +548,8 @@ export class FontManager {
 
             const fonts = Object.values(searchResults)
                 .flatMap((result) => result.result)
-                // @ts-ignore
-                .map((font) => this.convertFont(font.doc))
+                .filter((font) => font.doc !== null)
+                .map((font) => convertRawFont(font.doc as RawFont)) // Cast since we know it's font data
                 .filter((font) => !this._fonts.some((f) => f.family === font.family));
 
             if (fonts.length === 0) {
@@ -600,6 +603,10 @@ export class FontManager {
         return this._isUploading;
     }
 
+    get isScanning() {
+        return this._isScanning;
+    }
+
     get currentFontIndex() {
         return this._currentFontIndex;
     }
@@ -618,6 +625,7 @@ export class FontManager {
         this._currentFontIndex = 0;
         this._isFetching = false;
         this._isUploading = false;
+        this._isScanning = false;
 
         // Clean up file watcher
         this.cleanupFontConfigFileWatcher();
@@ -1246,7 +1254,6 @@ export class FontManager {
         const normalizedFilePath = normalizePath(filePath);
 
         try {
-
             const content = await sandbox.readFile(normalizedFilePath);
             if (!content) {
                 console.error(`Failed to read file: ${normalizedFilePath}`);
@@ -1303,6 +1310,8 @@ export class FontManager {
 
         this.fontConfigFileWatcher = sandbox.fileEventBus.subscribe('*', async (event) => {
             const normalizedFontConfigPath = normalizePath(this.fontConfigPath);
+            console.log('normalizedFontConfigPath', normalizedFontConfigPath);
+            console.log('event.paths', event.paths);
             const affectsFont = event.paths.some(
                 (path) => normalizePath(path) === normalizedFontConfigPath,
             );
@@ -1491,17 +1500,20 @@ export default config;
                     ) {
                         const declarator = declaration.declarations[0];
                         if (declarator && isValidLocalFontDeclaration(declarator, fontName)) {
-                            // @ts-ignore
-                            const configObject = declarator.init?.arguments[0] as t.ObjectExpression;
-                            const srcProp = configObject.properties.find((prop) =>
-                                isPropertyWithName(prop, 'src'),
-                            );
-                            if (
-                                srcProp &&
-                                t.isObjectProperty(srcProp) &&
-                                t.isArrayExpression(srcProp.value)
-                            ) {
-                                srcProp.value.elements.push(...fontsSrc);
+                            const configObject = t.isCallExpression(declarator.init) 
+                                ? declarator.init.arguments[0] as t.ObjectExpression
+                                : null;
+                            if (configObject && t.isObjectExpression(configObject)) {
+                                const srcProp = configObject.properties.find((prop) =>
+                                    isPropertyWithName(prop, 'src'),
+                                );
+                                if (
+                                    srcProp &&
+                                    t.isObjectProperty(srcProp) &&
+                                    t.isArrayExpression(srcProp.value)
+                                ) {
+                                    srcProp.value.elements.push(...fontsSrc);
+                                }
                             }
                         }
                     }
@@ -1509,7 +1521,7 @@ export default config;
             },
         });
     }
- 
+
     private cleanupFontConfigFileWatcher(): void {
         if (this.fontConfigFileWatcher) {
             this.fontConfigFileWatcher();
