@@ -1752,7 +1752,7 @@ var DefaultSettings = {
   },
   IMAGE_FOLDER: "public",
   IMAGE_DIMENSION: { width: "100px", height: "100px" },
-  FONT_FOLDER: "public/fonts",
+  FONT_FOLDER: "fonts",
   FONT_CONFIG: "app/fonts.ts",
   TAILWIND_CONFIG: "tailwind.config.ts",
   CHAT_SETTINGS: {
@@ -17417,5 +17417,5 @@ export {
   penpalParent
 };
 
-//# debugId=CC134AE8460242E364756E2164756E21
+//# debugId=7AB273697E2189B064756E2164756E21
 //# sourceMappingURL=index.js.map
